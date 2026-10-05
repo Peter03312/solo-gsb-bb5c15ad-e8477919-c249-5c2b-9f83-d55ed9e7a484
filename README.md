@@ -4,11 +4,18 @@
 系统录入选手的**唯一出发打卡**以及途中、终点打卡（每条含记录号、点位、距发枪秒数），自动核算成绩、
 支持裁判作废/更正打卡并**重算**，以及**发布冻结**成绩版本。
 
-**统一停表（本轮新增）**：赛事因天气等原因统一停表时，裁判可登记若干**距发枪秒数**表示的停表区间
+**统一停表**：赛事因天气等原因统一停表时，裁判可登记若干**距发枪秒数**表示的停表区间
 （起止均为非负整数、起点小于终点，重叠区间只计一次）；完成选手的**净耗时 = 原始耗时 −
 停表区间并集与其「出发→终点」区间的交长**，排名与并列按净耗时；`elapsed` 仍为原始耗时，另返回 `netElapsed`，
 未完赛者无净耗时。关卡/终点截止与有效链仍按原始秒数判定。停表配置变动须携带 `expectedRevision`，
 无效区间整次拒绝；发布版冻结当时的停表区间与净耗时，后续调整不改历史版。
+
+**组别赛道（本轮新增）**：同场赛事可设不同**参赛组别**，裁判为每个组别配置自己的**有序关卡、
+可替代点位与关卡/终点截止**，并按**号码布**指定选手组别；**未分组者沿用现有赛道**。选手按所属赛道构造有效链，
+停表与净耗时规则不变；`rank` 保持**全场净耗时名次**，另返回只在**同组完赛者**中计算且允许并列的
+`groupRank`（未分组完赛者同属「默认赛道组」），未完赛者两种名次均为空。组别赛道或归属变更须携带
+`expectedRevision`，**原子生效**并推动整案预演、确认与实时成绩重算；过期返回当前修订，
+未知组别、重复归属或空替代点位**整次拒绝**。发布版冻结组别赛道、归属与两种名次，后续变更不改历史。
 
 技术栈：**Node.js + Express + React（Vite）+ SQLite（better-sqlite3）**。
 
@@ -27,7 +34,8 @@ docker compose up --build
 - 打开网页：**http://localhost:3000**
 - API 根路径：`http://localhost:3000/api/...`
 - 容器启动时自动建表（`server/src/schema.sql`）并初始化 SQLite 数据库；
-  默认写入一套演示赛事与打卡数据（含逆序多余打卡、终点超时、组未完成、并列、重复出发等待争议样例）。
+  默认写入一套演示赛事与打卡数据（含逆序多余打卡、终点超时、组未完成、并列、重复出发等待争议样例，
+  以及两个演示组别赛道：精英组 ELITE 与体验组 FUN）。
 - 数据库持久化在命名卷 `orienteering-data`（容器内 `/data/orienteering.db`）。
 
 停止：`docker compose down`（数据保留）；连同数据清除：`docker compose down -v`。
@@ -84,19 +92,24 @@ npm start          # http://localhost:3000
 1. 每个选手必须有且仅有一条 `kind=start` 的出发打卡（点位须等于起点）。
 2. 从出发后的读数中构造**最早有效链**：
    - 关卡组按设置顺序依次通过，每组在其可替代点位中任选其一；
+   - **赛道按选手所属组别确定**：已分组者用其组别赛道（组别的有序关卡组、替代点位、组截止与终点截止），
+     未分组者沿用「关卡设置」中的现有赛道；组别的终点截止留空时沿用赛事统一终点截止；
    - 选中打卡的距发枪秒数必须**严格递增**（`>`，相等不算），每组取满足条件的**最早**一条（贪心即最优：
      更早的选择只会给后续更大的时间窗口）；
    - 若该组设置了组截止秒数，还须不晚于该秒数。
-3. 终点打卡必须在最后一组之后、且距发枪秒数不超过终点截止秒数（`<=`，刚好在截止点有效）。
+3. 终点打卡必须在最后一组之后、且距发枪秒数不超过所属赛道的终点截止秒数（`<=`，刚好在截止点有效）。
 4. **逆序打卡与多余打卡**（如途中再次经过起点、无关点位、晚于终点的打卡）不作为任何组/终点的完成依据。
 5. 完成者按**净耗时**升序排名，**同净耗时并列同名次**；`elapsed`（原始耗时 = 终点秒数 − 出发秒数）语义不变，
    另返回 `netElapsed`（净耗时）与 `stoppedSecs`（被扣减的停表秒数），未完赛者净耗时为 `null`。
+   - `rank`：**全场**净耗时名次（跨组别所有完赛者一起排）；
+   - `groupRank`：只在**同一组别**的完赛者中按净耗时计算（允许并列；未分组完赛者同属「默认赛道组」）；
+   - **未完赛者两种名次均为空**（`rank`/`groupRank` 均为 `null`）。
 6. 无有效链时指出首个失败位置：
    - 出发缺失/不唯一/点位错误；
    - 第一个未在严格递增且截止前通过的关卡组（含组名与原因）；
    - 终点缺失或**终点超时**（给出实际秒数与截止值）。
 
-## 统一停表与净耗时（本轮新增）
+## 统一停表与净耗时
 
 赛事因天气等原因**统一停表**时，按「距发枪秒数」登记停表区间，规则如下：
 
@@ -153,6 +166,86 @@ curl -s http://localhost:3000/api/results
 # HTTP/1.1 409 -> { "error": "赛事已修订，请刷新后重试", "currentRevision": 6 }
 ```
 
+## 组别赛道与组内名次（本轮新增）
+
+同场赛事可设不同**参赛组别**，每个组别有自己完整的赛道定义；选手按号码布归属某一组别，
+**未分组者沿用「关卡设置」中的现有赛道**。规则如下：
+
+1. 每个组别（`division`）含：**唯一代码** `code`、名称、可选的**终点截止秒数** `finishCutoff`
+   （留空沿用赛事终点截止），以及**至少一个按顺序通过的关卡组**；每组含名称、可选组截止秒数
+   与**至少一个可替代点位**（**空替代点位整次拒绝**；点位在组别内不跨组重复，且不得与起点/终点相同）。
+2. 归属（`assignments`）按**号码布**指定：`{ bib, division }`；一个号码布至多属于一个组别，
+   **同一号码布重复指定 → 整次拒绝**；指向未在本次提交中定义的组别代码（**未知组别**）或
+   不存在的号码布 → 整次拒绝。号码布须已有选手记录（先导入打卡再分组）。
+3. 选手按**所属赛道**构造最早有效链（严格递增、组截止、终点截止均按所属赛道判定）；
+   停表区间与净耗时规则对所有赛道一致（停表是赛事级的）。
+4. `rank` 保持**全场净耗时名次**（跨组别）；`groupRank` 只在**同组完赛者**中按净耗时计算、
+   **允许并列**；未分组完赛者彼此同属「默认赛道组」计算组内名次；**未完赛者两种名次均为空**。
+5. 组别赛道与归属是赛事级配置，**整体替换、原子生效**：保存须携带 `expectedRevision`，
+   过期返回 **409 + `currentRevision`**；任一校验失败 **400 整次拒绝**（不部分写入）；
+   提交内容与现状完全相同为只读操作，不推进修订号。每次有效变更推进赛事修订号，
+   因此**整案预演令牌随之过期**（确认返回 409 需重新预演），实时成绩立即按新赛道重算。
+6. **发布冻结**当时的组别赛道、归属与两种名次（`divisions_json` / `assignments_json` 进入快照，
+   `published_result` 落 `group_rank` 与 `division` 列）；之后再调整组别或归属，历史版本不变。
+7. 旧数据库首次启动自动迁移：新建 `division` / `division_group` / `division_group_point` /
+   `runner_division` 四表；为历史 `publication` 回填空组别/空归属，为历史 `published_result`
+   回填 `group_rank = rank_no`（旧版发布时无组别，组内名次即全场名次）。
+   未使用组别的旧调用（导入、成绩、整案、发布）完全不受影响。
+
+### 组别赛道 HTTP 调用示例
+
+```bash
+# 1) 查询当前组别赛道与归属（含修订号）
+curl -s http://localhost:3000/api/divisions
+# -> { "configured": true, "revision": 1,
+#      "divisions": [
+#        { "code": "ELITE", "name": "精英组", "finishCutoff": 1500,
+#          "groups": [ { "name": "北山组", "cutoffSecs": 600,  "points": ["A1","A2"] },
+#                      { "name": "湖畔组", "cutoffSecs": 1200, "points": ["B1","B2"] } ] },
+#        { "code": "FUN", "name": "体验组", "finishCutoff": 1200,
+#          "groups": [ { "name": "体验组", "cutoffSecs": 900, "points": ["C1","C2"] } ] }
+#      ],
+#      "assignments": [ { "bib": "001", "division": "ELITE" }, ... ] }
+
+# 2) 整体替换组别赛道与归属（须携带 expectedRevision；原子生效）
+curl -s -X POST http://localhost:3000/api/divisions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expectedRevision": 1,
+    "divisions": [
+      { "code": "ELITE", "name": "精英组", "finishCutoff": 1500,
+        "groups": [
+          { "name": "北山组", "cutoffSecs": 600,  "points": ["A1", "A2"] },
+          { "name": "湖畔组", "cutoffSecs": 1200, "points": ["B1", "B2"] }
+        ] },
+      { "code": "FUN", "name": "体验组", "finishCutoff": 1200,
+        "groups": [ { "name": "体验组", "cutoffSecs": 900, "points": ["C1", "C2"] } ] }
+    ],
+    "assignments": [
+      { "bib": "001", "division": "ELITE" },
+      { "bib": "201", "division": "FUN" }
+    ]
+  }'
+# -> { "ok": true, "revision": 2, "changed": true, "divisions": [...], "assignments": [...] }
+# 提交与现状相同的内容：{ "ok": true, "changed": false, "revision": 1 }（只读，不推进修订）
+# 清空全部组别与归属：divisions: [], assignments: []
+
+# 3) 实时成绩同时返回全场名次与组内名次
+curl -s http://localhost:3000/api/results
+# -> { "divisions": [...], "assignments": [...], "results": [
+#      { "bib":"001", "division":"ELITE", "divisionName":"精英组",
+#        "status":"ok", "elapsed":910, "netElapsed":810,
+#        "rank":1, "groupRank":1, "chain":[...] },
+#      { "bib":"002", "division":null, "status":"finish_dnf",
+#        "elapsed":null, "netElapsed":null, "rank":null, "groupRank":null, ... } ] }
+
+# 4) 整次拒绝 / 修订过期
+# 未知组别：  HTTP/1.1 400 -> { "error": "号码布 008 指定的组别「NOPE」不存在，整次拒绝" }
+# 重复归属：  HTTP/1.1 400 -> { "error": "号码布 008 在归属名单中被重复指定，整次拒绝" }
+# 空替代点位：HTTP/1.1 400 -> { "error": "组别「X」第 1 组「g」至少一个替代点位（空替代点位整次拒绝）" }
+# 修订过期：  HTTP/1.1 409 -> { "error": "赛事已修订，请刷新后重试", "currentRevision": 2 }
+```
+
 ## 裁判操作（争议复核）
 
 - **作废**打卡：填写原因，读数标记 voided 并不再参与核算；
@@ -181,13 +274,13 @@ curl -s http://localhost:3000/api/results
 
 ## 发布冻结与赛事修订
 
-- 每次关卡设置、停表区间变动、批量导入（确有新增时）、作废/更正、发布都会推进赛事 `revision` 修订号；
-  导入全部为幂等跳过、停表保存后并集无变化时为只读操作，不推进修订号。
-- 导入、发布与停表配置必须在请求中携带 `expectedRevision`；与当前修订不一致时返回 **HTTP 409 及 `currentRevision`**
-  （前端提示刷新），避免覆盖他人更改。
-- 发布将**关卡配置 + 停表区间 + 全部有效读数（作废读数除外）+ 当次成绩（含净耗时）**整体快照写入
-  `publication` / `published_result` 表，版本号递增；历史版只读，后续更正/作废/重导/停表调整
-  **不修改任何历史版**。
+- 每次关卡设置、组别赛道/归属变更、停表区间变动、批量导入（确有新增时）、作废/更正、发布都会推进赛事
+  `revision` 修订号；导入全部为幂等跳过、停表或组别保存后内容无变化时为只读操作，不推进修订号。
+- 导入、发布、停表配置与组别配置必须在请求中携带 `expectedRevision`；与当前修订不一致时返回
+  **HTTP 409 及 `currentRevision`**（前端提示刷新），避免覆盖他人更改。
+- 发布将**关卡配置 + 组别赛道与归属 + 停表区间 + 全部有效读数（作废读数除外）+ 当次成绩
+  （含净耗时与两种名次）**整体快照写入 `publication` / `published_result` 表，版本号递增；
+  历史版只读，后续更正/作废/重导/停表调整/组别变更**不修改任何历史版**。
 - 批量导入校验：
   - 秒数必须为非负整数，出现**负秒数 → 整批拒绝**；
   - **同号异「原始内容」→ 整批拒绝**：同记录号判定以该记录号**首次入库时**的
@@ -345,46 +438,53 @@ curl -s -X POST http://localhost:3000/api/appeals/confirm \
 
 ## 页面说明
 
-- **成绩排名**：实时成绩、按净耗时的名次（含并列）、状态、失败组/超时说明、原始耗时/停表扣减/净耗时、每人的最早有效链。
+- **成绩排名**：实时成绩、全场净耗时名次（含并列）与**组内名次**、所属组别、状态、失败组/超时说明、
+  原始耗时/停表扣减/净耗时、每人的最早有效链；可按组别筛选查看组内成绩。
+- **组别赛道**：维护各参赛组别的有序关卡组、可替代点位、组/终点截止，并按号码布维护选手归属
+  （未分组者沿用现有赛道）；客户端即时校验，保存携带修订号、原子生效。
 - **停表区间**：整体维护距发枪秒数表示的停表区间（客户端即时校验、预览合并后的并集），保存携带修订号。
 - **整案申诉**：按号码布挑选多条打卡组成同一申诉，逐条作废/更正并填原因；先预演查看所有受影响选手
   （含名次联动者）处理前后的成绩（原始/净耗时）、名次、失败原因与有效链差异，再一次性原子确认。
 - **争议复核**：按号码布查看打卡，执行单条作废/更正并查看完整操作留痕。
 - **打卡导入**：批量粘贴导入，展示整批校验结果。
-- **关卡设置**：维护起点/终点、终点截止、顺序关卡组、组内替代点位与组截止。
-- **发布冻结**：发布新版本、浏览各历史冻结版的关卡/停表区间/读数/成绩（含冻结的净耗时）。
+- **关卡设置**：维护起点/终点、终点截止、顺序关卡组、组内替代点位与组截止（即未分组选手的默认赛道）。
+- **发布冻结**：发布新版本、浏览各历史冻结版的关卡/组别赛道与归属/停表区间/读数/成绩
+  （含冻结的净耗时与两种名次）。
 
 ## 主要 API
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/event` | 当前赛事配置、停表区间与修订号 |
+| GET | `/api/event` | 当前赛事配置、停表区间、组别赛道/归属与修订号 |
 | POST | `/api/setup` | 设置关卡组（body 需 `expectedRevision`） |
 | GET | `/api/stoppages` | 当前停表区间并集与修订号 |
 | POST | `/api/stoppages` | 整体替换停表区间（需 `expectedRevision`；无效区间 400 整次拒绝，过期 409） |
+| GET | `/api/divisions` | 当前组别赛道与号码布归属（含修订号） |
+| POST | `/api/divisions` | 整体替换组别赛道与归属（需 `expectedRevision`；未知组别/重复归属/空替代点位 400 整次拒绝，过期 409） |
 | POST | `/api/punches/import` | 批量导入（按首次入库原始读数幂等；冲突整批拒绝，409 过期 / 400 拒绝） |
 | GET | `/api/punches?bib=` | 打卡与审计记录 |
 | POST | `/api/punches/:id/void` | 作废（reason 必填） |
 | POST | `/api/punches/:id/correct` | 更正（newPoint/newSeconds/reason） |
 | POST | `/api/appeals/preview` | 整案预演（只读，返回处理前后对比与签名 token；409 过期 / 400 整案无效） |
 | POST | `/api/appeals/confirm` | 整案确认（expectedRevision + token；原子落库只推进一次修订，409 需重新预演） |
-| GET | `/api/results` | 当前实时成绩排名（含 `elapsed` 原始耗时与 `netElapsed` 净耗时） |
-| POST | `/api/publications` | 发布冻结快照（含停表区间与净耗时，需 `expectedRevision`） |
-| GET | `/api/publications` / `/api/publications/:version` | 版本列表 / 历史冻结版详情（含 `stoppages`） |
+| GET | `/api/results` | 当前实时成绩排名（含 `elapsed`/`netElapsed`、全场 `rank` 与组内 `groupRank`、所属组别） |
+| POST | `/api/publications` | 发布冻结快照（含组别赛道/归属、停表区间与两种名次，需 `expectedRevision`） |
+| GET | `/api/publications` / `/api/publications/:version` | 版本列表 / 历史冻结版详情（含 `stoppages`、`divisions`、`assignments`） |
 
 ## 目录结构
 
 ```
 server/            Express + better-sqlite3 后端
-  src/index.mjs    API 路由（含整案申诉 /api/appeals/preview|confirm、停表区间 /api/stoppages）
+  src/index.mjs    API 路由（含整案申诉 /api/appeals/preview|confirm、停表区间 /api/stoppages、组别赛道 /api/divisions）
   src/appeals.mjs  整案操作校验、只读内存预演、签名令牌与原子提交
-  src/scoring.mjs  最早有效链、区间并集/交长、净耗时与排名算法（支持内存读数核算）
-  src/db.mjs       SQLite 连接/建表/修订号/旧库迁移（停表列回填）
-  src/seed.mjs     演示数据（含一段天气停表区间 500–600s）
-  src/schema.sql   数据库表结构（stoppage_interval、publication.stoppages_json、published_result.net_elapsed）
-  e2e-test.mjs     端到端断言（122 项，覆盖核算/整批拒绝/修订锁/冻结/重导语义/整案申诉/停表净耗时）
+  src/scoring.mjs  最早有效链（按所属赛道）、区间并集/交长、净耗时、全场名次与组内名次（支持内存读数核算）
+  src/db.mjs       SQLite 连接/建表/修订号/旧库迁移（停表列、组别四表与发布版组内名次回填）
+  src/seed.mjs     演示数据（含天气停表区间 500–600s、精英组/体验组两个组别赛道与归属）
+  src/schema.sql   数据库表结构（stoppage_interval、division 系列表、runner_division、
+                   publication.stoppages_json/divisions_json/assignments_json、published_result.net_elapsed/group_rank/division）
+  e2e-test.mjs     端到端断言（162 项，覆盖核算/整批拒绝/修订锁/冻结/重导语义/整案申诉/停表净耗时/组别赛道与组内名次）
 web/               React + Vite 前端
-  src/components/  七个功能页面（成绩/停表区间/整案申诉/单条复核/导入/设置/发布）
+  src/components/  八个功能页面（成绩/组别赛道/停表区间/整案申诉/单条复核/导入/设置/发布）
 Dockerfile         多阶段构建（前端构建 + 后端 + 运行镜像）
 docker-compose.yml 一键启动、建表、初始化数据，端口 3000
 ```
@@ -396,6 +496,6 @@ docker-compose.yml 一键启动、建表、初始化数据，端口 3000
 rm -f data/orienteering.db*
 SEED=1 node server/src/index.mjs
 
-# 终端 2：运行 122 项断言（含整案申诉预演/确认、停表净耗时、冻结版不可变）
+# 终端 2：运行 162 项断言（含整案申诉预演/确认、停表净耗时、组别赛道与组内名次、冻结版不可变）
 node server/e2e-test.mjs http://localhost:3000
 ```

@@ -157,10 +157,13 @@ const slimResult = (r) => ({
   bib: r.bib,
   name: r.name ?? null,
   status: r.status,
+  division: r.division ?? null,
+  divisionName: r.divisionName ?? null,
   elapsed: r.elapsed ?? null,
   netElapsed: r.netElapsed ?? null,
   stoppedSecs: r.stoppedSecs ?? null,
   rank: r.rank ?? null,
+  groupRank: r.groupRank ?? null,
   failAt: r.failAt ?? null,
   detail: r.detail ?? '',
   chain: r.chain,
@@ -183,6 +186,7 @@ function resultChanged(a, b) {
     (a.elapsed ?? null) !== (b.elapsed ?? null) ||
     (a.netElapsed ?? null) !== (b.netElapsed ?? null) ||
     (a.rank ?? null) !== (b.rank ?? null) ||
+    (a.groupRank ?? null) !== (b.groupRank ?? null) ||
     (a.failAt ?? null) !== (b.failAt ?? null) ||
     a.detail !== b.detail ||
     chainDiff(a.chain, b.chain).removed.length + chainDiff(a.chain, b.chain).added.length > 0

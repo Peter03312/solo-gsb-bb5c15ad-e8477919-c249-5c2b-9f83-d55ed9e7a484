@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { api } from '../api.js';
 
 export function fmtTime(secs) {
@@ -20,6 +20,7 @@ const STATUS_LABEL = {
 
 export default function Results() {
   const [data, setData] = useState(null);
+  const [divisionFilter, setDivisionFilter] = useState('all'); // all | none | 组别代码
 
   useEffect(() => {
     const load = () => api.results().then(setData).catch(() => setData(null));
@@ -28,8 +29,19 @@ export default function Results() {
     return () => clearInterval(timer);
   }, []);
 
+  const divisionName = useMemo(() => {
+    const m = new Map((data?.divisions || []).map(d => [d.code, d.name]));
+    return code => (code == null ? '未分组' : `${m.get(code) || code}（${code}）`);
+  }, [data]);
+
   if (!data) return <p className="muted">加载中…</p>;
   if (!data.configured) return <p className="muted">赛事尚未配置，请先到「关卡设置」建立关卡组与截止秒数。</p>;
+
+  const rows = data.results.filter(r =>
+    divisionFilter === 'all' ? true :
+    divisionFilter === 'none' ? r.division == null :
+    r.division === divisionFilter
+  );
 
   return (
     <div>
@@ -50,22 +62,41 @@ export default function Results() {
         )}
         ；排名与并列按<b>净耗时</b>，关卡/终点截止与有效链仍按原始秒数判定。
       </p>
+      <p className="muted small">
+        组别赛道：每人按所属组别赛道构造有效链（未分组者沿用现有赛道）；<b>名次</b>为全场净耗时名次，
+        <b>组内名次</b>只在同组完赛者中计算（允许并列，未分组者同属「默认赛道组」），未完赛者两种名次均为空。
+      </p>
+      <div className="filter">
+        <select value={divisionFilter} onChange={e => setDivisionFilter(e.target.value)}>
+          <option value="all">全部组别（{data.results.length} 人）</option>
+          <option value="none">未分组（默认赛道）</option>
+          {(data.divisions || []).map(d => (
+            <option key={d.code} value={d.code}>{d.name}（{d.code}）</option>
+          ))}
+        </select>
+      </div>
       <table className="grid">
         <thead>
           <tr>
-            <th>名次</th><th>号码布</th><th>姓名</th><th>状态</th>
+            <th>名次</th><th>号码布</th><th>姓名</th><th>组别</th><th>组内名次</th><th>状态</th>
             <th>原始耗时</th><th>停表扣减</th><th>净耗时</th>
             <th>首个未完成 / 说明</th><th className="chain-col">最早有效链</th>
           </tr>
         </thead>
         <tbody>
-          {data.results.map(r => {
+          {rows.map(r => {
             const st = STATUS_LABEL[r.status] || { text: r.status, cls: 'bad' };
             return (
               <tr key={r.bib} className={r.status === 'ok' ? '' : 'row-dnf'}>
                 <td>{r.rank ?? '—'}</td>
                 <td>{r.bib}</td>
                 <td>{r.name || '—'}</td>
+                <td>
+                  {r.division == null
+                    ? <span className="muted">未分组</span>
+                    : <span className="badge ok" title={r.divisionName}>{r.division}</span>}
+                </td>
+                <td>{r.groupRank ?? '—'}</td>
                 <td><span className={`badge ${st.cls}`}>{st.text}</span></td>
                 <td>{r.elapsed != null ? `${fmtTime(r.elapsed)}（${r.elapsed}s）` : '—'}</td>
                 <td>{r.stoppedSecs ? `${r.stoppedSecs}s` : (r.status === 'ok' ? '0s' : '—')}</td>
@@ -88,12 +119,16 @@ export default function Results() {
               </tr>
             );
           })}
+          {rows.length === 0 && (
+            <tr><td colSpan="11" className="muted">该筛选下暂无选手。</td></tr>
+          )}
         </tbody>
       </table>
       <p className="muted small">
-        规则：打卡时间相对发枪秒数须严格递增，按关卡组顺序每组在可替代点位中选最早一条；
+        规则：打卡时间相对发枪秒数须严格递增，按所属赛道的关卡组顺序每组在可替代点位中选最早一条；
         逆序及多余打卡不作完成依据。净耗时 = 原始耗时 − 停表区间并集与本人出发→终点区间的交长，
         同净耗时并列同名次；原始耗时（elapsed）语义不变。
+        {divisionFilter !== 'all' && <> 当前筛选：{divisionName(divisionFilter === 'none' ? null : divisionFilter)}。</>}
       </p>
     </div>
   );

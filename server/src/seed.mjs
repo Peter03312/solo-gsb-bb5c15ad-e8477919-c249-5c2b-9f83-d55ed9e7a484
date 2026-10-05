@@ -24,10 +24,32 @@ export function seedDemo(db) {
     const insStop = db.prepare('INSERT INTO stoppage_interval (start_secs, end_secs) VALUES (?, ?)');
     insStop.run(500, 600);
 
+    // 组别赛道（本轮新增演示）：同场赛事下不同参赛组别各有自己的有序关卡与截止
+    //  - ELITE 精英组：与默认赛道同点位，但终点截止更严（1500s）
+    //  - FUN   体验组：只过「体验组」{C1,C2}（≤900s），终点截止 1200s
+    // 未指定组别的选手（002/003/005）沿用上方默认赛道
+    const insDiv = db.prepare('INSERT INTO division (code, name, finish_cutoff, seq) VALUES (?, ?, ?, ?)');
+    const insDG = db.prepare('INSERT INTO division_group (division_id, seq, name, cutoff_secs) VALUES (?, ?, ?, ?)');
+    const insDGP = db.prepare('INSERT INTO division_group_point (group_id, point, seq) VALUES (?, ?, ?)');
+    const elite = insDiv.run('ELITE', '精英组', 1500, 1).lastInsertRowid;
+    const eg1 = insDG.run(elite, 1, '北山组', 600).lastInsertRowid;
+    const eg2 = insDG.run(elite, 2, '湖畔组', 1200).lastInsertRowid;
+    insDGP.run(eg1, 'A1', 1); insDGP.run(eg1, 'A2', 2);
+    insDGP.run(eg2, 'B1', 1); insDGP.run(eg2, 'B2', 2);
+    const fun = insDiv.run('FUN', '体验组', 1200, 2).lastInsertRowid;
+    const fg1 = insDG.run(fun, 1, '体验组', 900).lastInsertRowid;
+    insDGP.run(fg1, 'C1', 1); insDGP.run(fg1, 'C2', 2);
+
     const insRunner = db.prepare('INSERT INTO runner (bib, name) VALUES (?, ?)');
     insRunner.run('001', '张明'); insRunner.run('002', '李华');
     insRunner.run('003', '王芳'); insRunner.run('004', '赵强');
     insRunner.run('005', '陈晨'); insRunner.run('006', '孙磊');
+    insRunner.run('201', '刘洋'); insRunner.run('202', '周敏');
+
+    // 号码布归属：001/004/006 精英组，201/202 体验组；002/003/005 未分组（默认赛道）
+    const insAssign = db.prepare('INSERT INTO runner_division (bib, division_id) VALUES (?, ?)');
+    insAssign.run('001', elite); insAssign.run('004', elite); insAssign.run('006', elite);
+    insAssign.run('201', fun); insAssign.run('202', fun);
 
     // record_no 全局唯一；kind: start | enroute | finish
     // 首次入库时现值即原始读数，orig_* 同步落库
@@ -57,6 +79,12 @@ export function seedDemo(db) {
       // 006 孙磊：与 004 同耗时并列
       ['R0050','006','S',0,'start'], ['R0051','006','A2',400,'enroute'],
       ['R0052','006','B1',700,'enroute'], ['R0053','006','F',1000,'finish'],
+      // 201 刘洋（体验组）：C1@400 → F@1150，原始 1150、净 1050（追加在末尾，保持既有记录 id 不变）
+      ['R0201','201','S',0,'start'], ['R0202','201','C1',400,'enroute'],
+      ['R0203','201','F',1150,'finish'],
+      // 202 周敏（体验组）：C2@450 → F@1200（恰在组别终点截止），原始 1200、净 1100
+      ['R0204','202','S',0,'start'], ['R0205','202','C2',450,'enroute'],
+      ['R0206','202','F',1200,'finish'],
     ];
     const tx = db.transaction(() => {
       for (const r of rows) insP.run(r[0], r[1], r[2], r[3], r[4], r[1], r[2], r[3], r[4]);

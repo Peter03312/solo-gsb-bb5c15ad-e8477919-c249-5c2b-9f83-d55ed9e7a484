@@ -40,6 +40,26 @@ function checkRevision(req, res) {
   return true;
 }
 
+/** 把 loadConfig 的组别赛道与归属序列化为 API 形状（发布快照也复用）。
+ *  形状与 POST /api/divisions 的规范化提交一致（组顺序即数组顺序），便于无变化检测。 */
+function divisionsPayload(cfg) {
+  return {
+    divisions: cfg.divisions.map((d) => ({
+      code: d.code,
+      name: d.name,
+      finishCutoff: d.finish_cutoff ?? null,
+      groups: d.groups.map((g) => ({
+        name: g.name,
+        cutoffSecs: g.cutoff_secs ?? null,
+        points: g.points,
+      })),
+    })),
+    assignments: Object.entries(cfg.assignmentByBib)
+      .map(([bib, division]) => ({ bib, division }))
+      .sort((a, b) => a.bib.localeCompare(b.bib)),
+  };
+}
+
 // ---------- 赛事配置 ----------
 app.get('/api/event', (req, res) => {
   const cfg = loadConfig(db);
@@ -60,6 +80,8 @@ app.get('/api/event', (req, res) => {
     })),
     // 统一停表区间（已合并的不交并集）
     stoppages: cfg.stoppages.map((s) => ({ startSecs: s.start, endSecs: s.end })),
+    // 组别赛道与号码布归属（未分组选手沿用上方 groups 现有赛道）
+    ...divisionsPayload(cfg),
   });
 });
 
@@ -186,6 +208,146 @@ app.post('/api/stoppages', (req, res) => {
     stoppages: next.map((s) => ({ startSecs: s.start, endSecs: s.end })),
   });
 });
+
+// ---------- 组别赛道与号码布归属 ----------
+/**
+ * 解析并整次校验组别赛道与归属；任一非法返回 { error }（整次拒绝，不部分写入）。
+ * 规则：
+ *  - divisions 为数组（可空，空数组表示清除全部组别与归属）；组别代码唯一、名称必填；
+ *  - 每个组别至少一个有序关卡组；每组至少一个替代点位（空替代点位整次拒绝），
+ *    点位在组别内不跨组重复，且不得与赛事起点/终点相同；
+ *  - 组截止/终点截止可留空（终点截止留空沿用赛事终点截止），否则须为非负整数；
+ *  - assignments 为数组（可空）；号码布必须已存在、不得重复指定（重复归属整次拒绝），
+ *    指定的组别代码必须存在于本次提交的 divisions 中（未知组别整次拒绝）。
+ */
+function parseDivisions(db, cfg, body) {
+  const rawDivisions = body?.divisions;
+  const rawAssignments = body?.assignments ?? [];
+  if (!Array.isArray(rawDivisions))
+    return { error: 'divisions 须为数组（可空，空数组表示清除全部组别与归属）' };
+  if (!Array.isArray(rawAssignments)) return { error: 'assignments 须为数组（可空）' };
+
+  const divisions = [];
+  const codes = new Set();
+  for (let i = 0; i < rawDivisions.length; i++) {
+    const d = rawDivisions[i];
+    const where = `第 ${i + 1} 个组别`;
+    if (!d || typeof d !== 'object') return { error: `${where} 格式非法，整次拒绝` };
+    const code = typeof d.code === 'string' ? d.code.trim() : '';
+    if (!code) return { error: `${where}：组别代码必填，整次拒绝` };
+    if (codes.has(code)) return { error: `组别代码「${code}」重复，整次拒绝` };
+    codes.add(code);
+    const name = typeof d.name === 'string' ? d.name.trim() : '';
+    if (!name) return { error: `组别「${code}」名称必填，整次拒绝` };
+    const finishCutoff = d.finishCutoff == null ? null : d.finishCutoff;
+    if (finishCutoff != null && (!Number.isInteger(finishCutoff) || finishCutoff < 0))
+      return { error: `组别「${code}」终点截止秒数须为非负整数或留空（留空沿用赛事终点截止），整次拒绝` };
+    if (!Array.isArray(d.groups) || d.groups.length === 0)
+      return { error: `组别「${code}」至少设置一个关卡组，整次拒绝` };
+    const groups = [];
+    const divPoints = new Set();
+    for (let j = 0; j < d.groups.length; j++) {
+      const g = d.groups[j];
+      const gwhere = `组别「${code}」第 ${j + 1} 组`;
+      if (!g || typeof g.name !== 'string' || !g.name.trim())
+        return { error: `${gwhere} 名称非法，整次拒绝` };
+      const cutoff = g.cutoffSecs == null ? null : g.cutoffSecs;
+      if (cutoff != null && (!Number.isInteger(cutoff) || cutoff < 0))
+        return { error: `${gwhere}「${g.name}」截止秒数须为非负整数或留空，整次拒绝` };
+      if (!Array.isArray(g.points) || g.points.length === 0)
+        return { error: `${gwhere}「${g.name}」至少一个替代点位（空替代点位整次拒绝）` };
+      const pts = [];
+      for (const p of g.points) {
+        const pt = typeof p === 'string' ? p.trim() : '';
+        if (!pt) return { error: `${gwhere}「${g.name}」存在非法点位，整次拒绝` };
+        if (pts.includes(pt)) return { error: `${gwhere}「${g.name}」点位 ${pt} 重复，整次拒绝` };
+        if (divPoints.has(pt))
+          return { error: `点位 ${pt} 在组别「${code}」的多个组中出现，整次拒绝` };
+        if (pt === cfg.start_point || pt === cfg.finish_point)
+          return { error: `点位 ${pt} 不能与起点/终点相同，整次拒绝` };
+        pts.push(pt);
+        divPoints.add(pt);
+      }
+      groups.push({ name: g.name.trim(), cutoffSecs: cutoff, points: pts });
+    }
+    divisions.push({ code, name, finishCutoff, groups });
+  }
+
+  const assignments = [];
+  const seenBibs = new Set();
+  const runnerExists = db.prepare('SELECT 1 FROM runner WHERE bib = ?');
+  for (let i = 0; i < rawAssignments.length; i++) {
+    const a = rawAssignments[i];
+    const where = `第 ${i + 1} 条归属`;
+    if (!a || typeof a !== 'object') return { error: `${where} 格式非法，整次拒绝` };
+    const bib = typeof a.bib === 'string' ? a.bib.trim() : '';
+    if (!bib) return { error: `${where}：号码布必填，整次拒绝` };
+    const code = typeof a.division === 'string' ? a.division.trim() : '';
+    if (!code || !codes.has(code))
+      return { error: `号码布 ${bib} 指定的组别「${code || a.division}」不存在，整次拒绝` };
+    if (seenBibs.has(bib)) return { error: `号码布 ${bib} 在归属名单中被重复指定，整次拒绝` };
+    seenBibs.add(bib);
+    if (!runnerExists.get(bib))
+      return { error: `号码布 ${bib} 尚无选手记录（请先导入打卡），整次拒绝` };
+    assignments.push({ bib, division: code });
+  }
+  assignments.sort((a, b) => a.bib.localeCompare(b.bib));
+  return { divisions, assignments };
+}
+
+app.get('/api/divisions', (req, res) => {
+  const cfg = loadConfig(db);
+  if (!cfg) return res.json({ configured: false, revision: 0, divisions: [], assignments: [] });
+  res.json({ configured: true, revision: cfg.revision, ...divisionsPayload(cfg) });
+});
+
+/**
+ * POST /api/divisions 整体替换组别赛道与号码布归属：
+ * body: { expectedRevision,
+ *         divisions: [{ code, name, finishCutoff?, groups: [{ name, cutoffSecs?, points: [...] }] }],
+ *         assignments: [{ bib, division }] }
+ * 原子生效：全部校验通过后在单个事务内替换并推进修订号（连带使整案预演令牌过期、
+ * 实时成绩按新赛道重算）；未知组别 / 重复归属 / 空替代点位等任一非法 => 400 整次拒绝；
+ * 修订号过期 => 409 + currentRevision；提交内容与现状完全相同时为只读，不推进修订。
+ */
+app.post('/api/divisions', (req, res) => {
+  if (!checkRevision(req, res)) return;
+  const cfg = loadConfig(db);
+  if (!cfg) return badRequest(res, '赛事尚未配置，请先设置关卡组');
+  const parsed = parseDivisions(db, cfg, req.body);
+  if (parsed.error) return badRequest(res, parsed.error);
+  const { divisions, assignments } = parsed;
+
+  const cur = divisionsPayload(cfg);
+  const next = { divisions, assignments };
+  const changed = JSON.stringify(cur) !== JSON.stringify(next);
+  let revision = cfg.revision;
+  if (changed) {
+    revision = db.transaction(() => {
+      db.prepare('DELETE FROM runner_division').run();
+      db.prepare('DELETE FROM division').run(); // 级联删除组别关卡组与替代点位
+      const insD = db.prepare('INSERT INTO division (code, name, finish_cutoff, seq) VALUES (?, ?, ?, ?)');
+      const insG = db.prepare(
+        'INSERT INTO division_group (division_id, seq, name, cutoff_secs) VALUES (?, ?, ?, ?)'
+      );
+      const insP = db.prepare('INSERT INTO division_group_point (group_id, point, seq) VALUES (?, ?, ?)');
+      const insA = db.prepare('INSERT INTO runner_division (bib, division_id) VALUES (?, ?)');
+      const idByCode = new Map();
+      divisions.forEach((d, i) => {
+        const did = insD.run(d.code, d.name, d.finishCutoff, i + 1).lastInsertRowid;
+        idByCode.set(d.code, did);
+        d.groups.forEach((g, j) => {
+          const gid = insG.run(did, j + 1, g.name, g.cutoffSecs).lastInsertRowid;
+          g.points.forEach((p, k) => insP.run(gid, p, k + 1));
+        });
+      });
+      for (const a of assignments) insA.run(a.bib, idByCode.get(a.division));
+      return bumpRevision(db);
+    })();
+  }
+  res.json({ ok: true, revision, changed, ...divisionsPayload(loadConfig(db)) });
+});
+
 /**
  * 整批校验：负秒数、同记录号异「原始内容」=> 整批拒绝（事务回滚）。
  * 同号判定以该记录号【首次入库时】的原始读数（bib/point/seconds/kind）为准，
@@ -296,6 +458,8 @@ app.get('/api/results', (req, res) => {
     finishCutoff: cfg.finish_cutoff,
     groups: cfg.groups.map((g) => ({ name: g.name, seq: g.seq, cutoffSecs: g.cutoff_secs, points: g.points })),
     stoppages: cfg.stoppages.map((s) => ({ startSecs: s.start, endSecs: s.end })),
+    // 组别赛道与归属；成绩中 division/groupRank 为所属组别与组内名次（未分组者按默认赛道组计算）
+    ...divisionsPayload(cfg),
     results,
   });
 });
@@ -448,18 +612,23 @@ app.post('/api/publications', (req, res) => {
     // 冻结发布当时的停表区间并集；后续调整不改历史版
     const stoppages = cfg.stoppages.map((s) => ({ startSecs: s.start, endSecs: s.end }));
     const stoppagesJson = JSON.stringify(stoppages);
+    // 冻结发布当时的组别赛道与号码布归属；后续变更不改历史版
+    const frozen = divisionsPayload(cfg);
+    const divisionsJson = JSON.stringify(frozen.divisions);
+    const assignmentsJson = JSON.stringify(frozen.assignments);
     const readingsJson = JSON.stringify(readings);
     const resultsJson = JSON.stringify(results);
     db.prepare(
-      `INSERT INTO publication (version, event_revision, note, config_json, stoppages_json, readings_json, results_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).run(version, cfg.revision, note, configJson, stoppagesJson, readingsJson, resultsJson);
-    const insR = db.prepare(
-      `INSERT INTO published_result (publication_version, bib, name, status, elapsed, net_elapsed, fail_at, detail, rank_no)
+      `INSERT INTO publication (version, event_revision, note, config_json, stoppages_json, divisions_json, assignments_json, readings_json, results_json)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(version, cfg.revision, note, configJson, stoppagesJson, divisionsJson, assignmentsJson, readingsJson, resultsJson);
+    const insR = db.prepare(
+      `INSERT INTO published_result (publication_version, bib, name, status, elapsed, net_elapsed, fail_at, detail, rank_no, group_rank, division)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     for (const r of results)
-      insR.run(version, r.bib, r.name, r.status, r.elapsed, r.netElapsed ?? null, r.failAt ?? null, r.detail, r.rank ?? null);
+      insR.run(version, r.bib, r.name, r.status, r.elapsed, r.netElapsed ?? null, r.failAt ?? null, r.detail,
+        r.rank ?? null, r.groupRank ?? null, r.division ?? null);
     // 发布本身冻结快照；继续推进修订号，使旧页面的导入/发布请求走过期核对
     const rev = bumpRevision(db);
     return { version, rev };
@@ -487,6 +656,9 @@ app.get('/api/publications/:version', (req, res) => {
     note: row.note,
     config: JSON.parse(row.config_json),
     stoppages: JSON.parse(row.stoppages_json || '[]'),
+    // 冻结的组别赛道与归属（旧版发布时无组别，迁移回填为空数组）
+    divisions: JSON.parse(row.divisions_json || '[]'),
+    assignments: JSON.parse(row.assignments_json || '[]'),
     readings: JSON.parse(row.readings_json),
     results: JSON.parse(row.results_json),
   });

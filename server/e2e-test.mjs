@@ -515,5 +515,155 @@ console.log('10) 统一停表区间与净耗时');
     newSnap.stoppages.length === 0 && newSnap.results.find(x => x.bib === '101').netElapsed === 950);
 }
 
+console.log('11) 组别赛道与组内名次');
+{
+  // 11.1 种子组别赛道与归属（与配置同事务落库）
+  const dv = (await call('/api/divisions')).body;
+  ok('11.1 种子含 ELITE/FUN 两个组别赛道',
+    dv.divisions.length === 2 && dv.divisions[0].code === 'ELITE' && dv.divisions[1].code === 'FUN');
+  ok('11.1 精英组终点截止 1500、体验组 1200（覆盖赛事 1800）',
+    dv.divisions[0].finishCutoff === 1500 && dv.divisions[1].finishCutoff === 1200);
+  ok('11.1 体验组赛道仅一组、替代点位 C1/C2',
+    JSON.stringify(dv.divisions[1].groups.map(g => g.points)) === JSON.stringify([['C1', 'C2']]));
+  ok('11.1 归属 5 人（001/004/006→ELITE，201/202→FUN）',
+    dv.assignments.length === 5 && dv.assignments.some(a => a.bib === '201' && a.division === 'FUN'));
+  const ev11 = (await call('/api/event')).body;
+  ok('11.1 /api/event 同步返回组别与归属', ev11.divisions.length === 2 && ev11.assignments.length === 5);
+
+  const rs1 = await resultsByBib();
+  ok('11.1 001 属 ELITE：组内第 1（全场第 6）',
+    rs1.get('001').division === 'ELITE' && rs1.get('001').groupRank === 1 && rs1.get('001').rank === 6,
+    JSON.stringify({ rank: rs1.get('001').rank, groupRank: rs1.get('001').groupRank }));
+  ok('11.1 004/006 同净耗时并列组内第 2',
+    rs1.get('004').groupRank === 2 && rs1.get('006').groupRank === 2);
+  ok('11.1 201/202 按体验组赛道完赛：组内 1/2（全场 11/12）',
+    rs1.get('201').division === 'FUN' && rs1.get('201').groupRank === 1 && rs1.get('201').rank === 11 &&
+    rs1.get('202').groupRank === 2 && rs1.get('202').rank === 12);
+  ok('11.1 未分组者同属默认赛道组：090 组内第 1（全场第 1）',
+    rs1.get('090').division === null && rs1.get('090').groupRank === 1 && rs1.get('090').rank === 1);
+  ok('11.1 未完赛者两种名次均为空（002 终点超时 / 080 组未完成）',
+    rs1.get('002').rank == null && rs1.get('002').groupRank == null &&
+    rs1.get('080').rank == null && rs1.get('080').groupRank == null);
+
+  // 11.2 整次拒绝（均不落库、不推进修订）
+  const r0 = await rev();
+  const baseDivisions = dv.divisions;
+  const baseAssignments = dv.assignments;
+  const post = (payload) => call('/api/divisions', { method: 'POST', body: JSON.stringify(payload) });
+  const unknownDiv = await post({ expectedRevision: r0, divisions: baseDivisions, assignments: [{ bib: '008', division: 'NOPE' }] });
+  ok('11.2 未知组别 400 整次拒绝', unknownDiv.status === 400 && /不存在/.test(unknownDiv.body.error));
+  const dupBib = await post({ expectedRevision: r0, divisions: baseDivisions,
+    assignments: [...baseAssignments, { bib: '008', division: 'ELITE' }, { bib: '008', division: 'FUN' }] });
+  ok('11.2 重复归属 400 整次拒绝', dupBib.status === 400 && /重复指定/.test(dupBib.body.error));
+  const emptyPts = await post({ expectedRevision: r0,
+    divisions: [{ code: 'X', name: '测试', groups: [{ name: 'g', points: [] }] }], assignments: [] });
+  ok('11.2 空替代点位 400 整次拒绝', emptyPts.status === 400 && /替代点位/.test(emptyPts.body.error));
+  const dupCode = await post({ expectedRevision: r0, divisions: [
+    { code: 'X', name: 'a', groups: [{ name: 'g', points: ['P1'] }] },
+    { code: 'X', name: 'b', groups: [{ name: 'g', points: ['P2'] }] },
+  ], assignments: [] });
+  ok('11.2 组别代码重复 400', dupCode.status === 400 && /重复/.test(dupCode.body.error));
+  const startPt = await post({ expectedRevision: r0,
+    divisions: [{ code: 'X', name: 'a', groups: [{ name: 'g', points: ['S'] }] }], assignments: [] });
+  ok('11.2 点位与起点相同 400', startPt.status === 400 && /起点/.test(startPt.body.error));
+  const unknownBib = await post({ expectedRevision: r0, divisions: baseDivisions,
+    assignments: [{ bib: '999', division: 'ELITE' }] });
+  ok('11.2 未知号码布 400', unknownBib.status === 400 && /999/.test(unknownBib.body.error));
+  const stale = await post({ expectedRevision: r0 + 999, divisions: [], assignments: [] });
+  ok('11.2 过期修订 409 带 currentRevision', stale.status === 409 && stale.body.currentRevision === r0);
+  ok('11.2 整次拒绝后修订号与配置不变',
+    (await rev()) === r0 && (await call('/api/divisions')).body.assignments.length === 5);
+  const noop = await post({ expectedRevision: r0, divisions: baseDivisions, assignments: baseAssignments });
+  ok('11.2 提交内容与现状相同：只读，不推进修订',
+    noop.status === 200 && noop.body.changed === false && noop.body.revision === r0);
+
+  // 11.3 归属变更原子生效并推动实时重算：008 分入 ELITE
+  const a1 = await post({ expectedRevision: r0, divisions: baseDivisions,
+    assignments: [...baseAssignments, { bib: '008', division: 'ELITE' }] });
+  ok('11.3 归属变更成功且修订 +1', a1.status === 200 && a1.body.changed === true && a1.body.revision === r0 + 1);
+  const rs2 = await resultsByBib();
+  ok('11.3 008 按精英组赛道完赛（777≤1500）并成为组内第 1',
+    rs2.get('008').division === 'ELITE' && rs2.get('008').status === 'ok' && rs2.get('008').groupRank === 1);
+  ok('11.3 ELITE 组内名次联动：001 退至组内第 2，004/006 并列第 3',
+    rs2.get('001').groupRank === 2 && rs2.get('004').groupRank === 3 && rs2.get('006').groupRank === 3);
+  ok('11.3 全场名次不受归属影响（008 仍全场第 4）', rs2.get('008').rank === 4);
+
+  // 11.4 组别/归属变更使整案预演令牌过期（确认 409，需重新预演）
+  const r1 = await rev();
+  const p090 = (await call('/api/punches?bib=090')).body.punches.find(x => x.record_no === 'C005');
+  const pv = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ expectedRevision: r1, operations: [
+    { punchId: p090.id, action: 'correct', reason: '测试组别变更联动', newPoint: 'A1', newSeconds: 310 },
+  ]})});
+  ok('11.4 整案预演成功', pv.status === 200 && typeof pv.body.token === 'string');
+  const un = await post({ expectedRevision: r1, divisions: baseDivisions, assignments: baseAssignments });
+  ok('11.4 他人把 008 移回未分组：修订再 +1', un.status === 200 && un.body.revision === r1 + 1);
+  const staleCf = await call('/api/appeals/confirm', { method: 'POST', body: JSON.stringify({ expectedRevision: r1 + 1, token: pv.body.token }) });
+  ok('11.4 旧预演确认 409 并返回当前修订', staleCf.status === 409 && staleCf.body.currentRevision === r1 + 1);
+  const p090After = (await call('/api/punches?bib=090')).body.punches.find(x => x.record_no === 'C005');
+  ok('11.4 被拒整案未部分生效（C005 仍 A1@300）', p090After.point === 'A1' && p090After.seconds === 300);
+
+  // 11.5 发布冻结组别赛道、归属与两种名次；后续变更不改历史
+  const r2 = await rev();
+  const pub = await call('/api/publications', { method: 'POST', body: JSON.stringify({ expectedRevision: r2, note: '组别冻结版' }) });
+  ok('11.5 发布成功', pub.status === 200);
+  const vDiv = pub.body.version;
+  const snap = (await call(`/api/publications/${vDiv}`)).body;
+  ok('11.5 快照冻结组别赛道与归属（008 已移回，共 5 条归属）',
+    snap.divisions.length === 2 && snap.assignments.length === 5 &&
+    snap.assignments.every(a => a.bib !== '008'));
+  const s001 = snap.results.find(x => x.bib === '001');
+  const s201 = snap.results.find(x => x.bib === '201');
+  ok('11.5 快照成绩含两种名次（001 全场第 6 / ELITE 组内第 1）',
+    s001.division === 'ELITE' && s001.rank === 6 && s001.groupRank === 1);
+  ok('11.5 快照 201 体验组组内第 1', s201.division === 'FUN' && s201.groupRank === 1);
+
+  // 清空全部组别（有效变更）：所有完赛者落入默认赛道组，组内名次=全场名次
+  const r3 = await rev();
+  const cleared = await post({ expectedRevision: r3, divisions: [], assignments: [] });
+  ok('11.5 清空组别成功并推进修订', cleared.status === 200 && cleared.body.revision === r3 + 1);
+  const rs3 = await resultsByBib();
+  ok('11.5 清空后 001 回到默认赛道，组内名次=全场名次',
+    rs3.get('001').division === null && rs3.get('001').groupRank === rs3.get('001').rank);
+  const snapAgain = (await call(`/api/publications/${vDiv}`)).body;
+  const s001b = snapAgain.results.find(x => x.bib === '001');
+  ok('11.5 历史版仍冻结组别与组内名次（001 仍 ELITE 组内第 1）',
+    snapAgain.divisions.length === 2 && s001b.division === 'ELITE' && s001b.groupRank === 1);
+
+  // 11.6 选手按所属赛道构造有效链：同一选手换组后按新赛道判定
+  const r4 = await rev();
+  await post({ expectedRevision: r4, divisions: baseDivisions, assignments: baseAssignments });
+  const r5 = await rev();
+  const move5 = await post({ expectedRevision: r5, divisions: baseDivisions,
+    assignments: [...baseAssignments, { bib: '005', division: 'FUN' }] });
+  ok('11.6 005 改分体验组', move5.status === 200);
+  const rs4 = await resultsByBib();
+  ok('11.6 005 按体验组赛道判定：无 C1/C2 打卡 → 组未完成于「体验组」，两种名次为空',
+    rs4.get('005').division === 'FUN' && rs4.get('005').status === 'group_dnf' &&
+    rs4.get('005').failAt === '体验组' && rs4.get('005').rank == null && rs4.get('005').groupRank == null);
+  const r6 = await rev();
+  await post({ expectedRevision: r6, divisions: baseDivisions, assignments: baseAssignments });
+  const rs5 = await resultsByBib();
+  ok('11.6 005 移回未分组后按默认赛道完赛（980）',
+    rs5.get('005').status === 'ok' && rs5.get('005').elapsed === 980);
+
+  // 11.7 组别终点截止覆盖赛事值：002 在放宽截止的长距离组中完赛（1850≤1900）
+  const r7 = await rev();
+  const longDiv = [...baseDivisions, { code: 'LONG', name: '长距离组', finishCutoff: 1900,
+    groups: [
+      { name: '北山组', cutoffSecs: 600, points: ['A1', 'A2'] },
+      { name: '湖畔组', cutoffSecs: 1200, points: ['B1', 'B2'] },
+    ] }];
+  const move2 = await post({ expectedRevision: r7, divisions: longDiv,
+    assignments: [...baseAssignments, { bib: '002', division: 'LONG' }] });
+  ok('11.7 002 分入长距离组（组别终点截止 1900）', move2.status === 200);
+  const rs6 = await resultsByBib();
+  ok('11.7 002 按组别终点截止完赛（1850≤1900；赛事截止 1800 下原本超时），组内第 1',
+    rs6.get('002').status === 'ok' && rs6.get('002').elapsed === 1850 && rs6.get('002').groupRank === 1);
+  const r8 = await rev();
+  await post({ expectedRevision: r8, divisions: baseDivisions, assignments: baseAssignments });
+  const rs7 = await resultsByBib();
+  ok('11.7 移回未分组后 002 恢复终点超时', rs7.get('002').status === 'finish_dnf' && rs7.get('002').rank == null);
+}
+
 console.log(`\n结果：${pass} 通过，${fail} 失败`);
 process.exit(fail ? 1 : 0);

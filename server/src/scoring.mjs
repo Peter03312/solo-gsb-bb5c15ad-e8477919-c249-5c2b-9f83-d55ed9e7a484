@@ -2,7 +2,7 @@
 // 的最早有效链（贪心：每组取时间允许范围内最早的一条有效打卡）。
 // 逆序打卡、多余打卡不作完成依据。
 
-/** 读取当前赛事配置（含停表区间，已合并为不交并集） */
+/** 读取当前赛事配置（含停表区间，已合并为不交并集；含组别赛道与选手归属） */
 export function loadConfig(db) {
   const ev = db.prepare('SELECT * FROM event WHERE id = 1').get();
   if (!ev) return null;
@@ -18,7 +18,56 @@ export function loadConfig(db) {
   const stoppages = mergeIntervals(
     db.prepare('SELECT start_secs AS start, end_secs AS end FROM stoppage_interval').all()
   );
-  return { ...ev, groups, stoppages };
+  // 组别赛道（各自的有序关卡组 + 可替代点位 + 组/终点截止）
+  const divisions = db
+    .prepare('SELECT id, code, name, finish_cutoff, seq FROM division ORDER BY seq, id')
+    .all();
+  for (const d of divisions) {
+    d.groups = db
+      .prepare('SELECT id, seq, name, cutoff_secs FROM division_group WHERE division_id = ? ORDER BY seq')
+      .all(d.id);
+    for (const g of d.groups) {
+      g.points = db
+        .prepare('SELECT point FROM division_group_point WHERE group_id = ? ORDER BY seq')
+        .all(g.id)
+        .map((r) => r.point);
+    }
+  }
+  // 号码布 → 组别代码
+  const assignmentByBib = {};
+  for (const r of db
+    .prepare('SELECT rd.bib AS bib, d.code AS code FROM runner_division rd JOIN division d ON d.id = rd.division_id')
+    .all())
+    assignmentByBib[r.bib] = r.code;
+  const divisionByCode = Object.fromEntries(divisions.map((d) => [d.code, d]));
+  return { ...ev, groups, stoppages, divisions, divisionByCode, assignmentByBib };
+}
+
+/**
+ * 选手所属赛道：已分组者用其组别赛道（组别终点截止留空时沿用赛事终点截止），
+ * 未分组者沿用赛事现有赛道（起点/终点与关卡组）。起点/终点为赛事级，各组别一致。
+ */
+export function courseFor(config, bib) {
+  const code = config.assignmentByBib?.[bib];
+  const div = code ? config.divisionByCode?.[code] : null;
+  if (div) {
+    return {
+      startPoint: config.start_point,
+      finishPoint: config.finish_point,
+      finishCutoff: div.finish_cutoff ?? config.finish_cutoff,
+      groups: div.groups,
+      division: div.code,
+      divisionName: div.name,
+    };
+  }
+  return {
+    startPoint: config.start_point,
+    finishPoint: config.finish_point,
+    finishCutoff: config.finish_cutoff,
+    groups: config.groups,
+    division: null,
+    divisionName: null,
+  };
 }
 
 /**
@@ -92,6 +141,32 @@ export function rankResults(results) {
       prevNet = n;
     }
   });
+  // 组内名次：只在同一组别（未分组者同属「默认赛道组」）的完赛者中按净耗时排名，
+  // 同净耗时并列同名次；未完赛者 groupRank 保持 null。
+  const byDivision = new Map();
+  for (const r of results) {
+    const key = r.division ?? null;
+    if (!byDivision.has(key)) byDivision.set(key, []);
+    byDivision.get(key).push(r);
+  }
+  for (const cohort of byDivision.values()) {
+    const finishers = cohort
+      .filter((r) => r.elapsed != null)
+      .sort((a, b) => {
+        const na = netOf(a);
+        const nb = netOf(b);
+        if (na !== nb) return na - nb;
+        return a.bib.localeCompare(b.bib);
+      });
+    let gRank = 0;
+    let gPrev = null;
+    finishers.forEach((r, i) => {
+      const n = netOf(r);
+      if (n !== gPrev) gRank = i + 1;
+      r.groupRank = gRank;
+      gPrev = n;
+    });
+  }
   return results;
 }
 
@@ -112,13 +187,19 @@ export function computeRunner(db, config, bib, name = null) {
 /**
  * 纯函数版核算：给定某选手的有效读数数组（内存预演可用虚拟读数），
  * 计算最早有效链、失败原因与耗时。readings 形如 { record_no, point, seconds, kind }。
+ * 有效链按选手所属赛道构造：已分组者用组别赛道，未分组者沿用赛事现有赛道。
  */
 export function computeRunnerFromReadings(readings, config, bib, name = null) {
+  const course = courseFor(config, bib);
   const base = {
     bib, name, status: 'ok',
+    division: course.division, // 所属组别代码（未分组为 null）
+    divisionName: course.divisionName,
     elapsed: null, // 原始耗时（终点 − 出发秒数），语义不变
     netElapsed: null, // 净耗时 = 原始耗时 − 停表区间并集与[出发,终点]的交长；未完赛者无
     stoppedSecs: null, // 该选手中被扣减的停表秒数
+    rank: null, // 全场净耗时名次（由 rankResults 填写；未完赛者保持空）
+    groupRank: null, // 同组完赛者内的净耗时名次（并列同名次；未完赛者保持空）
     failAt: null, detail: '', chain: [],
   };
   // 保证按 seconds、记录次序严格递增处理（调用方通常已排序，这里再排一次以免预演漏排）
@@ -133,15 +214,15 @@ export function computeRunnerFromReadings(readings, config, bib, name = null) {
   if (starts.length > 1)
     return { ...base, status: 'bad_start', detail: '出发打卡不唯一' };
   const start = starts[0];
-  if (start.point !== config.start_point)
-    return { ...base, status: 'bad_start', detail: `出发打卡点位非起点「${config.start_point}」` };
+  if (start.point !== course.startPoint)
+    return { ...base, status: 'bad_start', detail: `出发打卡点位非起点「${course.startPoint}」` };
 
   const after = punches.filter((p) => p.record_no !== start.record_no && p.seconds >= start.seconds);
   let lastSeconds = start.seconds;
   const chain = [slim(start)];
 
-  // 依序通过各组：每组选时间严格递增的最早一条（可替代点位任一即可）
-  for (const g of config.groups) {
+  // 依序通过所属赛道的各组：每组选时间严格递增的最早一条（可替代点位任一即可）
+  for (const g of course.groups) {
     const hit = after.find(
       (p) =>
         p.seconds > lastSeconds &&
@@ -160,20 +241,20 @@ export function computeRunnerFromReadings(readings, config, bib, name = null) {
     lastSeconds = hit.seconds;
   }
 
-  // 终点：严格递增且在终点截止前（含等于）
+  // 终点：严格递增且在终点截止前（含等于；组别赛道可用自己的终点截止）
   const finish = after.find(
     (p) =>
-      p.point === config.finish_point &&
+      p.point === course.finishPoint &&
       p.seconds > lastSeconds &&
-      p.seconds <= config.finish_cutoff
+      p.seconds <= course.finishCutoff
   );
   if (!finish) {
     const late = after
-      .filter((p) => p.point === config.finish_point && p.seconds > lastSeconds)
+      .filter((p) => p.point === course.finishPoint && p.seconds > lastSeconds)
       .sort((a, b) => a.seconds - b.seconds)[0];
     const detail = late
-      ? `终点超时：${late.seconds}s 超过截止 ${config.finish_cutoff}s`
-      : `未在 ${config.finish_cutoff} 秒截止前到达终点`;
+      ? `终点超时：${late.seconds}s 超过截止 ${course.finishCutoff}s`
+      : `未在 ${course.finishCutoff} 秒截止前到达终点`;
     return { ...base, status: 'finish_dnf', failAt: '终点', detail, chain };
   }
   chain.push(slim(finish));

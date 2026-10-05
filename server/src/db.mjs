@@ -22,6 +22,32 @@ export function initDb(db = getDb()) {
   db.exec(schema);
   migratePunchOriginals(db);
   migrateStopwatch(db);
+  migrateDivisions(db);
+}
+
+/**
+ * 旧库迁移：组别赛道功能新增列。
+ * - division / division_group / division_group_point / runner_division 为新表，
+ *   CREATE TABLE IF NOT EXISTS 已自动建立；
+ * - publication 增加 divisions_json / assignments_json（旧发布版无组别配置，回填 '[]'）；
+ * - published_result 增加 group_rank / division：旧版发布时所有选手均未分组，
+ *   组内名次即全场名次，回填 group_rank = rank_no、division = NULL。
+ * 幂等：列已存在时跳过。
+ */
+function migrateDivisions(db) {
+  const pubCols = db.prepare('PRAGMA table_info(publication)').all().map((c) => c.name);
+  if (!pubCols.includes('divisions_json'))
+    db.exec("ALTER TABLE publication ADD COLUMN divisions_json TEXT NOT NULL DEFAULT '[]'");
+  if (!pubCols.includes('assignments_json'))
+    db.exec("ALTER TABLE publication ADD COLUMN assignments_json TEXT NOT NULL DEFAULT '[]'");
+  const resCols = db.prepare('PRAGMA table_info(published_result)').all().map((c) => c.name);
+  if (!resCols.includes('group_rank')) {
+    db.exec('ALTER TABLE published_result ADD COLUMN group_rank INTEGER');
+    // 旧发布版发布时尚无组别：未分组者的组内名次 = 全场名次（未完赛者两列均为 NULL）
+    db.prepare('UPDATE published_result SET group_rank = rank_no WHERE group_rank IS NULL AND rank_no IS NOT NULL').run();
+  }
+  if (!resCols.includes('division'))
+    db.exec('ALTER TABLE published_result ADD COLUMN division TEXT');
 }
 
 /**
