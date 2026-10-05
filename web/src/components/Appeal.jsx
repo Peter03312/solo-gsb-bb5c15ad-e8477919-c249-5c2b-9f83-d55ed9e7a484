@@ -31,7 +31,10 @@ function RankCell({ r }) {
   return (
     <div>
       <span className={`badge ${STATUS_CLS[r.status] || 'bad'}`}>{st}</span>
-      <div className="small muted">名次 {r.rank ?? '—'}</div>
+      <div className="small muted">
+        名次 {r.rank ?? '—'} · 组内 {r.groupRank ?? '—'}
+        {r.divisionCode ? `（${r.divisionCode}）` : ''}
+      </div>
       {r.elapsed != null ? (
         <>
           <div className="small">原始 {r.elapsed}s{r.stoppedSecs ? `（停表 −${r.stoppedSecs}s）` : ''}</div>
@@ -299,11 +302,12 @@ export default function Appeal({ event, onChanged, onError }) {
             {confirmResult.auditCount} 条变更及逐条审计已一次性写入（事务原子提交，无部分生效）；历史发布版保持冻结。
           </p>
           <table className="grid compact">
-            <thead><tr><th>名次</th><th>号码布</th><th>姓名</th><th>状态</th><th>原始耗时</th><th>净耗时</th><th>说明</th></tr></thead>
+            <thead><tr><th>名次</th><th>组内名次</th><th>号码布</th><th>姓名</th><th>状态</th><th>原始耗时</th><th>净耗时</th><th>说明</th></tr></thead>
             <tbody>
               {confirmResult.results.map(r => (
                 <tr key={r.bib} className={r.status === 'ok' ? '' : 'row-dnf'}>
                   <td>{r.rank ?? '—'}</td>
+                  <td>{r.groupRank ?? '—'}</td>
                   <td>{r.bib}</td>
                   <td>{r.name || '—'}</td>
                   <td><span className={`badge ${STATUS_CLS[r.status] || 'bad'}`}>{STATUS_LABEL[r.status] || r.status}</span></td>

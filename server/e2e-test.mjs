@@ -515,5 +515,189 @@ console.log('10) 统一停表区间与净耗时');
     newSnap.stoppages.length === 0 && newSnap.results.find(x => x.bib === '101').netElapsed === 950);
 }
 
+console.log('11) 组别赛道、选手归属与组内名次');
+{
+  // 11.1 种子含示范组别与归属；未分组者沿用默认赛道
+  const dv = (await call('/api/divisions')).body;
+  ok('11.1 /api/divisions 返回两个示范组别', dv.divisions.length === 2);
+  const me = dv.divisions.find(d => d.code === 'ME');
+  ok('11.1 ME 赛道含两组有序关卡与终点截止',
+    me && me.finishCutoff === 1800 && me.groups.length === 2 &&
+    JSON.stringify(me.groups[0].points) === JSON.stringify(['A1', 'A2']));
+  ok('11.1 归属含 201→ME、202→WE、203→ME',
+    JSON.stringify(dv.assignments) === JSON.stringify([
+      { bib: '201', divisionCode: 'ME' }, { bib: '202', divisionCode: 'WE' }, { bib: '203', divisionCode: 'ME' },
+    ]));
+  const ev = (await call('/api/event')).body;
+  ok('11.1 /api/event 同时返回默认赛道、组别与归属',
+    ev.groups.length === 2 && ev.divisions.length === 2 && ev.assignments.length === 3);
+
+  const rs = await resultsByBib();
+  ok('11.1 未分组 001 沿用默认赛道（链 S→A1→B1→F）',
+    rs.get('001').divisionCode == null &&
+    JSON.stringify(rs.get('001').chain.map(c => c.point)) === JSON.stringify(['S', 'A1', 'B1', 'F']));
+  ok('11.1 001 全场名次与组内名次均为 6（默认赛道 cohort）',
+    rs.get('001').rank === 6 && rs.get('001').groupRank === 6, JSON.stringify(rs.get('001')));
+  ok('11.1 201 按 ME 赛道完赛：elapsed 1250、全场 12、组内 1',
+    rs.get('201').status === 'ok' && rs.get('201').elapsed === 1250 &&
+    rs.get('201').rank === 12 && rs.get('201').groupRank === 1 && rs.get('201').divisionCode === 'ME');
+  ok('11.1 203 同组次席：全场 13、ME 组内 2',
+    rs.get('203').rank === 13 && rs.get('203').groupRank === 2 && rs.get('203').divisionCode === 'ME');
+  ok('11.1 202 WE 组内第 1（全场 11）',
+    rs.get('202').rank === 11 && rs.get('202').groupRank === 1 && rs.get('202').divisionCode === 'WE');
+  ok('11.1 004/006 组内并列（默认赛道同净耗时同组内名次）',
+    rs.get('004').groupRank === 9 && rs.get('006').groupRank === 9 && rs.get('004').rank === 9);
+  ok('11.1 未完赛者两种名次均为空',
+    rs.get('002').rank == null && rs.get('002').groupRank == null &&
+    rs.get('003').rank == null && rs.get('003').groupRank == null);
+
+  // 11.2 整次校验：未知组别 / 重复归属 / 空替代点位 / 过期修订（均不落库、不推进修订）
+  const r0 = await rev();
+  const validME = { code: 'ME', name: '男子精英组', finishCutoff: 1800, groups: [{ name: '山脊组', cutoffSecs: 600, points: ['A1', 'A2'] }] };
+  const unknown = await call('/api/divisions', { method: 'POST', body: JSON.stringify({ expectedRevision: r0,
+    divisions: [validME], assignments: [{ bib: '001', divisionCode: 'NOPE' }] })});
+  ok('11.2 未知组别 400 整次拒绝', unknown.status === 400 && /未知组别/.test(unknown.body.error));
+  const dup = await call('/api/divisions', { method: 'POST', body: JSON.stringify({ expectedRevision: r0,
+    divisions: [validME], assignments: [{ bib: '001', divisionCode: 'ME' }, { bib: '001', divisionCode: 'ME' }] })});
+  ok('11.2 重复归属 400 整次拒绝', dup.status === 400 && /重复归属/.test(dup.body.error));
+  const emptyPts = await call('/api/divisions', { method: 'POST', body: JSON.stringify({ expectedRevision: r0,
+    divisions: [{ code: 'X', name: '测试', finishCutoff: 100, groups: [{ name: 'g', points: [] }] }], assignments: [] })});
+  ok('11.2 空替代点位 400 整次拒绝', emptyPts.status === 400 && /替代点位为空/.test(emptyPts.body.error));
+  const noGroups = await call('/api/divisions', { method: 'POST', body: JSON.stringify({ expectedRevision: r0,
+    divisions: [{ code: 'X', name: '测试', finishCutoff: 100, groups: [] }], assignments: [] })});
+  ok('11.2 组别没有关卡组 400', noGroups.status === 400);
+  const stale = await call('/api/divisions', { method: 'POST', body: JSON.stringify({ expectedRevision: r0 + 999, divisions: [], assignments: [] })});
+  ok('11.2 过期修订 409 带 currentRevision', stale.status === 409 && stale.body.currentRevision === r0);
+  const noRev = await call('/api/divisions', { method: 'POST', body: JSON.stringify({ divisions: [] })});
+  ok('11.2 缺 expectedRevision 400', noRev.status === 400);
+  ok('11.2 整次拒绝后状态未变（仍 2 组别、修订未推进）',
+    (await call('/api/divisions')).body.divisions.length === 2 && (await rev()) === r0);
+
+  // 11.3 原子变更：ME 终点截止收紧 1300、新增 OPEN 组、001→OPEN、新号码布 301→OPEN，一次事务推进一次修订
+  const setup = await call('/api/divisions', { method: 'POST', body: JSON.stringify({
+    expectedRevision: r0,
+    divisions: [
+      { code: 'ME', name: '男子精英组', finishCutoff: 1300, groups: [
+        { name: '山脊组', cutoffSecs: 600, points: ['A1', 'A2'] },
+        { name: '湖畔组', cutoffSecs: 1200, points: ['B1', 'B2'] } ] },
+      { code: 'WE', name: '女子精英组', finishCutoff: 1200, groups: [
+        { name: '近郊组', cutoffSecs: 500, points: ['C1', 'C2'] } ] },
+      { code: 'OPEN', name: '公开组', finishCutoff: 1500, groups: [
+        { name: '打卡组', cutoffSecs: 1000, points: ['B1', 'B2'] } ] },
+    ],
+    assignments: [
+      { bib: '201', divisionCode: 'ME' }, { bib: '202', divisionCode: 'WE' },
+      { bib: '203', divisionCode: 'ME' }, { bib: '001', divisionCode: 'OPEN' },
+      { bib: '301', divisionCode: 'OPEN' },
+    ],
+  })});
+  ok('11.3 原子变更成功且修订只推进一次', setup.status === 200 && setup.body.changed === true && setup.body.revision === r0 + 1);
+  const rs3 = await resultsByBib();
+  ok('11.3 001 改走 OPEN 赛道（链 S→B1→F，无需 A 组），组内第 1、全场仍第 6',
+    rs3.get('001').divisionCode === 'OPEN' && rs3.get('001').elapsed === 910 &&
+    JSON.stringify(rs3.get('001').chain.map(c => c.point)) === JSON.stringify(['S', 'B1', 'F']) &&
+    rs3.get('001').groupRank === 1 && rs3.get('001').rank === 6);
+  ok('11.3 203 超 ME 新终点截止 1300：未完赛，两种名次均为空',
+    rs3.get('203').status === 'finish_dnf' && /1300/.test(rs3.get('203').detail) &&
+    rs3.get('203').rank == null && rs3.get('203').groupRank == null);
+  ok('11.3 201 仍 ME 组内第 1（全场 12）', rs3.get('201').groupRank === 1 && rs3.get('201').rank === 12);
+  ok('11.3 101 默认赛道组内名次递补为 6（001 已离组）', rs3.get('101').groupRank === 6);
+  ok('11.3 新号码布 301 自动登记：无出发、归属 OPEN、两种名次为空',
+    rs3.get('301').status === 'no_start' && rs3.get('301').divisionCode === 'OPEN' &&
+    rs3.get('301').rank == null && rs3.get('301').groupRank == null);
+
+  // 11.4 无变化保存：只读，不推进修订
+  const r1 = await rev();
+  const cur = (await call('/api/divisions')).body;
+  const noop = await call('/api/divisions', { method: 'POST', body: JSON.stringify({
+    expectedRevision: r1, divisions: cur.divisions, assignments: cur.assignments })});
+  ok('11.4 相同内容保存：200 且修订不变', noop.status === 200 && noop.body.changed === false && noop.body.revision === r1);
+
+  // 11.5 整案预演/确认携带组内名次：更正 203 终点 1350→1290 使其在 ME 组完赛
+  const p203 = (await call('/api/punches?bib=203')).body.punches.find(x => x.record_no === 'R0224');
+  const pv = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ expectedRevision: r1, operations: [
+    { punchId: p203.id, action: 'correct', reason: '终点读数笔误', newPoint: 'F', newSeconds: 1290 },
+  ]})});
+  ok('11.5 预演成功', pv.status === 200);
+  const am203 = new Map(pv.body.affected.map(x => [x.bib, x])).get('203');
+  ok('11.5 预演显示 203 处理后完赛 1290、ME 组内第 2、全场第 13',
+    am203 && am203.after.status === 'ok' && am203.after.elapsed === 1290 &&
+    am203.after.groupRank === 2 && am203.after.rank === 13, JSON.stringify(am203?.after));
+  ok('11.5 预演前 203 两种名次为空', am203.before.rank == null && am203.before.groupRank == null);
+  ok('11.5 201 不受影响的整案不出现在受影响名单', !pv.body.affected.some(x => x.bib === '201'));
+  const cf = await call('/api/appeals/confirm', { method: 'POST', body: JSON.stringify({ expectedRevision: r1, token: pv.body.token })});
+  ok('11.5 确认成功，修订 +1', cf.status === 200 && cf.body.revision === r1 + 1);
+  const rs5 = new Map(cf.body.results.map(x => [x.bib, x]));
+  ok('11.5 确认后实时成绩：203 完赛 1290 组内 2、201 组内 1',
+    rs5.get('203').status === 'ok' && rs5.get('203').groupRank === 2 && rs5.get('201').groupRank === 1);
+
+  // 11.5b 组别变更使待确认整案过期（推动整案重预演）
+  const r2 = await rev();
+  const p008 = (await call('/api/punches?bib=008')).body.punches.find(x => x.record_no === 'E4');
+  const pvX = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ expectedRevision: r2, operations: [
+    { punchId: p008.id, action: 'void', reason: '测试用作废' },
+  ]})});
+  ok('11.5b 变更前预演成功', pvX.status === 200);
+  const tighten = await call('/api/divisions', { method: 'POST', body: JSON.stringify({
+    expectedRevision: r2,
+    divisions: cur.divisions.map(d => d.code === 'OPEN' ? { ...d, finishCutoff: 1400 } : d),
+    assignments: cur.assignments })});
+  ok('11.5b 组别赛道变更推进修订', tighten.status === 200 && tighten.body.revision === r2 + 1);
+  const staleCf = await call('/api/appeals/confirm', { method: 'POST', body: JSON.stringify({ expectedRevision: r2, token: pvX.body.token })});
+  ok('11.5b 旧预演确认 409 且整案未生效', staleCf.status === 409 && staleCf.body.currentRevision === r2 + 1);
+  ok('11.5b 008 终点打卡仍未被作废', (await resultsByBib()).get('008').status === 'ok');
+
+  // 11.6 发布冻结组别赛道、归属与两种名次；后续变更不改历史版
+  const r3 = await rev();
+  const pub = await call('/api/publications', { method: 'POST', body: JSON.stringify({ expectedRevision: r3, note: '组别冻结版' })});
+  ok('11.6 发布成功', pub.status === 200);
+  const vDiv = pub.body.version;
+  const snap = (await call(`/api/publications/${vDiv}`)).body;
+  ok('11.6 快照冻结组别赛道（ME 1300 / WE 1200 / OPEN 1400）',
+    JSON.stringify(snap.divisions.divisions.map(d => [d.code, d.finishCutoff])) ===
+    JSON.stringify([['ME', 1300], ['WE', 1200], ['OPEN', 1400]]));
+  ok('11.6 快照冻结归属（001→OPEN、201→ME）',
+    snap.divisions.assignments.some(a => a.bib === '001' && a.divisionCode === 'OPEN') &&
+    snap.divisions.assignments.some(a => a.bib === '201' && a.divisionCode === 'ME'));
+  const s201 = snap.results.find(x => x.bib === '201');
+  const s203 = snap.results.find(x => x.bib === '203');
+  const s001 = snap.results.find(x => x.bib === '001');
+  ok('11.6 快照冻结两种名次：201 全场 12/组内 1，203 全场 13/组内 2，001 OPEN 组内 1',
+    s201.rank === 12 && s201.groupRank === 1 && s201.divisionCode === 'ME' &&
+    s203.rank === 13 && s203.groupRank === 2 &&
+    s001.groupRank === 1 && s001.divisionCode === 'OPEN');
+
+  // 清空全部组别与归属：所有选手回到默认赛道
+  const r4 = await rev();
+  const cleared = await call('/api/divisions', { method: 'POST', body: JSON.stringify({ expectedRevision: r4, divisions: [], assignments: [] })});
+  ok('11.6 清空组别成功并推进修订', cleared.status === 200 && cleared.body.changed === true && cleared.body.revision === r4 + 1);
+  const rs6 = await resultsByBib();
+  ok('11.6 清空后 201/203 回落默认赛道完赛（组内 11/12）',
+    rs6.get('201').divisionCode == null && rs6.get('201').status === 'ok' && rs6.get('201').groupRank === 11 &&
+    rs6.get('203').status === 'ok' && rs6.get('203').groupRank === 12);
+  ok('11.6 清空后 202 在默认赛道无 A 组打卡：组未完成、两种名次为空',
+    rs6.get('202').status === 'group_dnf' && rs6.get('202').rank == null && rs6.get('202').groupRank == null);
+  const snapAfter = (await call(`/api/publications/${vDiv}`)).body;
+  ok('11.6 历史版仍冻结旧组别/归属/名次（201 组内 1、ME）',
+    snapAfter.divisions.divisions.length === 3 &&
+    snapAfter.results.find(x => x.bib === '201').groupRank === 1 &&
+    snapAfter.results.find(x => x.bib === '201').divisionCode === 'ME');
+
+  // 11.7 旧调用兼容：默认赛道/成绩/历史版接口形态不变
+  const ev2 = (await call('/api/event')).body;
+  ok('11.7 清空后 /api/event 默认赛道不变、组别与归属为空',
+    ev2.groups.length === 2 && ev2.divisions.length === 0 && ev2.assignments.length === 0);
+  const snap1 = (await call('/api/publications/1')).body;
+  const v1r001 = snap1.results.find(x => x.bib === '001');
+  const v1r201 = snap1.results.find(x => x.bib === '201');
+  ok('11.7 早期发布版冻结当时组别/归属与两种名次，后续变更不改历史',
+    snap1.divisions.divisions.length === 2 && snap1.divisions.assignments.length === 3 &&
+    v1r001.rank === 2 && v1r001.groupRank === 2 &&
+    v1r201.divisionCode === 'ME' && v1r201.rank === 7 && v1r201.groupRank === 1);
+  const all = (await call('/api/results')).body.results;
+  ok('11.7 实时成绩每项都带 groupRank/divisionCode 字段（未完赛为 null）',
+    all.every(x => 'groupRank' in x && 'divisionCode' in x));
+}
+
 console.log(`\n结果：${pass} 通过，${fail} 失败`);
 process.exit(fail ? 1 : 0);

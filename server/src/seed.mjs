@@ -24,10 +24,29 @@ export function seedDemo(db) {
     const insStop = db.prepare('INSERT INTO stoppage_interval (start_secs, end_secs) VALUES (?, ?)');
     insStop.run(500, 600);
 
+    // 示范组别赛道：同场赛事不同组别走不同关卡序列与终点截止；未分组选手沿用上方默认赛道
+    const insDiv = db.prepare('INSERT INTO division (code, name, finish_cutoff, seq) VALUES (?, ?, ?, ?)');
+    const insDG = db.prepare('INSERT INTO division_group (division_id, seq, name, cutoff_secs) VALUES (?, ?, ?, ?)');
+    const insDGP = db.prepare('INSERT INTO division_group_point (group_id, point, seq) VALUES (?, ?, ?)');
+    const meId = insDiv.run('ME', '男子精英组', 1800, 1).lastInsertRowid;
+    const meG1 = insDG.run(meId, 1, '山脊组', 600).lastInsertRowid;
+    const meG2 = insDG.run(meId, 2, '湖畔组', 1200).lastInsertRowid;
+    insDGP.run(meG1, 'A1', 1); insDGP.run(meG1, 'A2', 2);
+    insDGP.run(meG2, 'B1', 1); insDGP.run(meG2, 'B2', 2);
+    const weId = insDiv.run('WE', '女子精英组', 1200, 2).lastInsertRowid;
+    const weG1 = insDG.run(weId, 1, '近郊组', 500).lastInsertRowid;
+    insDGP.run(weG1, 'C1', 1); insDGP.run(weG1, 'C2', 2);
+
     const insRunner = db.prepare('INSERT INTO runner (bib, name) VALUES (?, ?)');
     insRunner.run('001', '张明'); insRunner.run('002', '李华');
     insRunner.run('003', '王芳'); insRunner.run('004', '赵强');
     insRunner.run('005', '陈晨'); insRunner.run('006', '孙磊');
+    insRunner.run('201', '林峰'); insRunner.run('202', '许晴');
+    insRunner.run('203', '郑凯');
+
+    // 选手归属：按号码布指定组别（001–006 未分组，沿用默认赛道）
+    const insAsg = db.prepare('INSERT INTO runner_division (bib, division_id) VALUES (?, ?)');
+    insAsg.run('201', meId); insAsg.run('202', weId); insAsg.run('203', meId);
 
     // record_no 全局唯一；kind: start | enroute | finish
     // 首次入库时现值即原始读数，orig_* 同步落库
@@ -57,6 +76,15 @@ export function seedDemo(db) {
       // 006 孙磊：与 004 同耗时并列
       ['R0050','006','S',0,'start'], ['R0051','006','A2',400,'enroute'],
       ['R0052','006','B1',700,'enroute'], ['R0053','006','F',1000,'finish'],
+      // 201 林峰（ME 男子精英组）：按 ME 赛道完成 1250s
+      ['R0201','201','S',0,'start'], ['R0202','201','A1',300,'enroute'],
+      ['R0203','201','B2',800,'enroute'], ['R0204','201','F',1250,'finish'],
+      // 202 许晴（WE 女子精英组）：按 WE 赛道完成 1100s
+      ['R0211','202','S',0,'start'], ['R0212','202','C1',400,'enroute'],
+      ['R0213','202','F',1100,'finish'],
+      // 203 郑凯（ME 男子精英组）：按 ME 赛道完成 1350s，组内次于 201
+      ['R0221','203','S',0,'start'], ['R0222','203','A2',350,'enroute'],
+      ['R0223','203','B1',850,'enroute'], ['R0224','203','F',1350,'finish'],
     ];
     const tx = db.transaction(() => {
       for (const r of rows) insP.run(r[0], r[1], r[2], r[3], r[4], r[1], r[2], r[3], r[4]);

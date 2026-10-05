@@ -37,8 +37,8 @@ export default function Publish({ event, onChanged, onError }) {
     <div className="panel">
       <h2>发布与冻结</h2>
       <p className="muted small">
-        发布时将关卡配置、全部有效读数（作废读数除外）及当次成绩一并快照冻结；
-        发布后裁判仍可更正当前数据并发布新版，但<b>历史版本永不改变</b>。
+        发布时将关卡配置、组别赛道与选手归属、停表区间、全部有效读数（作废读数除外）及当次成绩
+        （含全场名次与组内名次）一并快照冻结；发布后裁判仍可更正当前数据并发布新版，但<b>历史版本永不改变</b>。
       </p>
       <div className="inline-fields">
         <label className="grow">版本备注（可选）<input value={note} onChange={e => setNote(e.target.value)} placeholder="如：申诉处理后第二版" /></label>
@@ -83,6 +83,29 @@ export default function Publish({ event, onChanged, onError }) {
                     : viewing.stoppages.map(s => `${s.startSecs}s–${s.endSecs}s`).join('，')}
                 </li>
               </ul>
+              <h4>冻结组别赛道与归属</h4>
+              {(viewing.divisions?.divisions || []).length === 0 ? (
+                <p className="muted small">无组别：发布时全部选手沿用默认赛道。</p>
+              ) : (
+                <>
+                  <ul className="muted small">
+                    {viewing.divisions.divisions.map(d => (
+                      <li key={d.code}>
+                        <b>{d.code}</b> {d.name}（终点截止 {d.finishCutoff}s）：
+                        {d.groups.map(g => `${g.name}[${g.points.join('/')}]${g.cutoffSecs == null ? '' : ` ≤${g.cutoffSecs}s`}`).join(' → ')}
+                      </li>
+                    ))}
+                  </ul>
+                  <div className="readings">
+                    {(viewing.divisions.assignments || []).map(a => (
+                      <span className="chip" key={a.bib}>{a.bib}<small>{a.divisionCode}</small></span>
+                    ))}
+                    {(viewing.divisions.assignments || []).length === 0 && (
+                      <span className="muted small">无归属记录</span>
+                    )}
+                  </div>
+                </>
+              )}
               <h4>冻结有效读数（{viewing.readings.length} 条）</h4>
               <div className="readings">
                 {viewing.readings.map(r => (
@@ -91,14 +114,16 @@ export default function Publish({ event, onChanged, onError }) {
               </div>
             </div>
             <div>
-              <h4>冻结成绩（按冻结停表区间的净耗时排名）</h4>
+              <h4>冻结成绩（全场名次按冻结停表区间的净耗时；组内名次为同组完赛者排名）</h4>
               <table className="grid compact">
-                <thead><tr><th>名次</th><th>号码</th><th>状态</th><th>原始耗时</th><th>净耗时</th><th>说明</th></tr></thead>
+                <thead><tr><th>名次</th><th>组内名次</th><th>号码</th><th>组别</th><th>状态</th><th>原始耗时</th><th>净耗时</th><th>说明</th></tr></thead>
                 <tbody>
                   {viewing.results.map(r => (
                     <tr key={r.bib}>
                       <td>{r.rank ?? '—'}</td>
+                      <td>{r.groupRank ?? '—'}</td>
                       <td>{r.bib}</td>
+                      <td>{r.divisionCode || <span className="muted small">未分组</span>}</td>
                       <td>{STATUS_LABEL[r.status] || r.status}</td>
                       <td>{r.elapsed != null ? `${fmtTime(r.elapsed)}（${r.elapsed}s）` : '—'}</td>
                       <td>{r.netElapsed != null ? <b>{`${fmtTime(r.netElapsed)}（${r.netElapsed}s）`}</b> : '—'}</td>

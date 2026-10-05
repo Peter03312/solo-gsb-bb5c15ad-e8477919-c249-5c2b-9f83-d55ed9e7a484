@@ -25,6 +25,38 @@ CREATE TABLE IF NOT EXISTS group_point (
   PRIMARY KEY (group_id, point)
 );
 
+-- 参赛组别（同场赛事可设不同组别赛道；未分组选手沿用上方默认赛道）
+CREATE TABLE IF NOT EXISTS division (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  code          TEXT NOT NULL UNIQUE,
+  name          TEXT NOT NULL,
+  finish_cutoff INTEGER NOT NULL CHECK (finish_cutoff >= 0),
+  seq           INTEGER NOT NULL
+);
+
+-- 组别赛道的有序关卡组（结构与默认赛道相同，按 seq 依次通过）
+CREATE TABLE IF NOT EXISTS division_group (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  division_id INTEGER NOT NULL REFERENCES division(id) ON DELETE CASCADE,
+  seq         INTEGER NOT NULL,
+  name        TEXT NOT NULL,
+  cutoff_secs INTEGER CHECK (cutoff_secs IS NULL OR cutoff_secs >= 0)
+);
+
+-- 组别关卡组内可替代点位（任选其一；空替代点位在保存时整次拒绝，不会落库）
+CREATE TABLE IF NOT EXISTS division_group_point (
+  group_id INTEGER NOT NULL REFERENCES division_group(id) ON DELETE CASCADE,
+  point    TEXT NOT NULL,
+  seq      INTEGER NOT NULL,
+  PRIMARY KEY (group_id, point)
+);
+
+-- 选手归属：按号码布指定组别；一个号码布最多属于一个组别，未归属者走默认赛道
+CREATE TABLE IF NOT EXISTS runner_division (
+  bib         TEXT PRIMARY KEY REFERENCES runner(bib),
+  division_id INTEGER NOT NULL REFERENCES division(id) ON DELETE CASCADE
+);
+
 -- 统一停表区间（天气等原因赛事统一停表；距发枪秒数，左闭右开，[start,end)）
 -- 全赛事单例集合：整体替换维护；重叠区间在核算时按并集只计一次。
 CREATE TABLE IF NOT EXISTS stoppage_interval (
@@ -75,7 +107,7 @@ CREATE TABLE IF NOT EXISTS punch_audit (
   at           TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- 发布快照（冻结，不可变）：同时冻结发布当时的停表区间
+-- 发布快照（冻结，不可变）：同时冻结发布当时的停表区间与组别赛道/归属
 CREATE TABLE IF NOT EXISTS publication (
   version         INTEGER PRIMARY KEY,
   event_revision  INTEGER NOT NULL,
@@ -83,12 +115,14 @@ CREATE TABLE IF NOT EXISTS publication (
   note            TEXT,
   config_json     TEXT NOT NULL,
   stoppages_json  TEXT NOT NULL DEFAULT '[]',
+  divisions_json  TEXT NOT NULL DEFAULT '{"divisions":[],"assignments":[]}',
   readings_json   TEXT NOT NULL,
   results_json    TEXT NOT NULL
 );
 
 -- 发布版成绩（便于排名查询），历史版永不被后续更正修改
 -- elapsed=原始耗时；net_elapsed=发布当时按冻结停表区间算出的净耗时（未完赛为 NULL）
+-- rank_no=全场净耗时名次；group_rank=同组完赛者中的组内名次（允许并列，未完赛为 NULL）
 CREATE TABLE IF NOT EXISTS published_result (
   publication_version INTEGER NOT NULL REFERENCES publication(version),
   bib         TEXT NOT NULL,
@@ -99,6 +133,8 @@ CREATE TABLE IF NOT EXISTS published_result (
   fail_at     TEXT,
   detail      TEXT,
   rank_no     INTEGER,
+  division_code TEXT,
+  group_rank  INTEGER,
   PRIMARY KEY (publication_version, bib)
 );
 
